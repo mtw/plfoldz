@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # -*-CPerl-*-
-# Last changed Time-stamp: <2018-05-15 18:33:54 mtw>
+# Last changed Time-stamp: <2018-07-12 16:28:17 mtw>
 #
 # Compute z-score for opening energies of intervals
 #
@@ -32,6 +32,7 @@ use Bio::ViennaNGS::Util qw(mkdircheck);
 use Statistics::Lite;
 use RNA;
 use Ushuffle;
+use diagnostics;
 
 my ($fastaO,$intervals,$od,$bn,$outfile,$outfh,$logfile,$logfh);
 my $infile_fa = undef;
@@ -40,21 +41,27 @@ my $outdir = undef;
 my $wantlog = undef;
 my $shuffle = 1000;
 my $winlength = 100;
+my $plfoldW = 100;
+my $plfoldL = 100;
 my $R=0.00198717; # R in kcal/mol/K
 my $T0=273.15;
 my $T=37; # default 37 celsius
 my $tempK=$T0+$T;
 my $kT=$R*$tempK;
 my $dinuc=undef;
+my $verbose=undef;
 
 Getopt::Long::config('no_ignore_case');
 pod2usage(-verbose => 1) unless GetOptions("f|fa=s"     => \$infile_fa,
 					   "b|bed=s"    => \$infile_bed,
 					   "o|outdir=s" => \$outdir,
-					   "l|log"      => sub{$wantlog=1},
+					   "log"      => sub{$wantlog=1},
 					   "n=s"        => \$shuffle,
 					   "d"          => sub{$dinuc=2},
+					   "v|verbose"  => sub{$verbose=1},
 					   "w|window=s" => \$winlength,
+					   "plfoldW=i"  => \$plfoldW,
+					   "plfoldL=i"  => \$plfoldL,
                                            "man"        => sub{pod2usage(-verbose => 2)},
                                            "help|h"     => sub{pod2usage(1)}
 					  );
@@ -94,8 +101,11 @@ $outfile = file($od,$bn.".plfoldz.out");
 open($outfh, ">", $outfile) or die "Cannot open outfile $outfile";
 
 if (defined $wantlog){
+
   $logfile = file($od,$bn.".plfoldz.log");
+  print "logfile $logfile ";
   open($logfh, ">", $logfile) or die "Cannot open logfile $logfile";
+  print "DONE\n";
 }
 
 #print ">>> $outfile\n";die;
@@ -171,7 +181,7 @@ foreach my $f (@{$intervals->data}){
   my $seqori = $seq5.$seq.$seq3;
   # compute opening energies for original sequence
   my $motifendpos = $motiflength+$winlength5;
-  my $motifoe = compute_opening_energy($seqori,$motiflength,100,100,$motifendpos);
+  my $motifoe = compute_opening_energy($seqori,$motiflength,$plfoldW,$plfoldL,$motifendpos,$logfh);
   if (defined $wantlog){
     print $logfh "0 $seqori * (pos $motifendpos): $motifoe\n";
   }
@@ -201,15 +211,15 @@ foreach my $f (@{$intervals->data}){
       if($#seq_do > 0){Ushuffle::shuffle($seq3,$shufseq3,$winlength3,$dinuc);}
       # print "D "  if (defined $wantlog);
     }
-    # print "$shufseq5 $seq $shufseq3(shuf)\n";
     my $seqshuf = $shufseq5.$seq.$shufseq3;
 
+
     # computation of unpair probs / opening energies via ViennaRNA library call:
-    my $oe = compute_opening_energy($seqshuf,$motiflength,100,100,$motifendpos);
+    my $oe = compute_opening_energy($seqshuf,$motiflength,$plfoldW,$plfoldL,$motifendpos,$logfh);
     if (defined $wantlog) {
       my $j = $i+1;
-      # print $logfh "$j $seqshuf S (pos $motifendpos): $oe\n";
-      print $logfh "$j\t$oe\n";
+      if ($verbose){ print $logfh "$j $seqshuf S (pos $motifendpos shuffle $i)\t$oe\n"}
+      else{print $logfh "$j\t$oe\n"}
     }
     push @shuf_oe, $oe;
   }
@@ -230,7 +240,7 @@ close($outfh);
 if (defined $wantlog){close($logfh)}
 
 sub compute_opening_energy {
-  my ($seq, $ulength, $window_size,$max_bp_span,$where) = @_;
+  my ($seq, $ulength, $window_size,$max_bp_span,$where,$lfh) = @_;
   my @oe = ();
   for (my $i=0;$i<length($seq);$i++){$oe[$i]=0.}
   # compute unpaired probabilities for original sequence
@@ -239,7 +249,7 @@ sub compute_opening_energy {
   for (my $i = $ulength;$i <= length($seq);$i++){
     my $up = $$up[$i][$ulength];
     $oe[$i] = -$kT*log($up);
-    # print "|$i|$ulength| up:$up\t oe:$oe[$i]\n";
+    #print $lfh "|$i|$ulength| up:$up\t oe:$oe[$i]\n";
   }
   return $oe[$where];
 }
@@ -264,7 +274,8 @@ plfoldz.pl - Compute z-score for opening energies of intervals
 =head1 SYNOPSIS
 
 plfoldz.pl [-f|--fa I<FILE>] [-b|--bed I<FILE>] [-n I<INT>] [-d]
-[-o|--outdir I<DIR>] [-w|--window I<INT>] [-l|--llog I<INT>] [options]
+[-o|--outdir I<DIR>] [-w|--window I<INT>] [--log] [--plfoldW I<INT>] 
+[--plfoldL I<INT>] [-v|--verbose] options
 
 =head1 DESCRIPTION
 
@@ -281,7 +292,7 @@ relative to the opening energy in a shuffled context
 
 The flanking regions upstream and downstream of the motif of interest
 are shuffled n times, while the motif itself is unchanged. Mean
-opening energies are computed for each suffled sequence and a z-score
+opening energies are computed for each shuffled sequence and a z-score
 is computed.
 
 Input RNA sequences are provided as BED6 intervals, together with a
@@ -312,7 +323,7 @@ Output directory. Output and log files are written there. The name of
 the output file is composed on the basename of the input BED file,
 with a 'plfoldz.out; suffix.
 
-=item B<-l|--log>
+=item B<--log>
 
 Optional flag, which triggers creation of a log file. The log file has
 the same name as the output file, but with a .log extenion.
@@ -330,6 +341,18 @@ Fisher-Yates mononucleotide shuffling.
 
 Window size of upstream/downstream nucleotides that will be used for
 shuffling.
+
+=item B<--plfoldW>
+
+Size of sliding window for computation of local base pairing probabilitied . This is essialliy the same as the -W parameter to RNAplfold.
+
+=item B<--plfoldL>
+
+Maximum base pair span. Corresponds to -L paramater of RNAplfold.
+
+=item B<-v|--verbose>
+
+Be verbose in the log file.
 
 =item B<--help -h>
 

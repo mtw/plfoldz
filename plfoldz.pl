@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # -*-CPerl-*-
-# Last changed Time-stamp: <2018-07-12 16:28:17 mtw>
+# Last changed Time-stamp: <2018-10-12 15:52:01 mtw>
 #
 # Compute z-score for opening energies of intervals
 #
@@ -30,11 +30,14 @@ use Bio::ViennaNGS::FeatureIO;
 use Bio::ViennaNGS::FeatureChain;
 use Bio::ViennaNGS::Util qw(mkdircheck);
 use Statistics::Lite;
+use Data::UUID;
+use Digest::SHA qw(sha1_base64);
+use YAML::XS;
 use RNA;
 use Ushuffle;
 use diagnostics;
 
-my ($fastaO,$intervals,$od,$bn,$outfile,$outfh,$logfile,$logfh);
+my ($fastaO,$intervals,$od,$bn,$yn,$outfile,$outfh,$yamlfile,$logfile,$logfh);
 my $infile_fa = undef;
 my $infile_bed = undef;
 my $outdir = undef;
@@ -50,21 +53,27 @@ my $tempK=$T0+$T;
 my $kT=$R*$tempK;
 my $dinuc=undef;
 my $verbose=undef;
+my $nozscore=undef;
+my $klet = 0;
+my @data = ();
+my %params = (); # plfoldz runtim parameters
 
 Getopt::Long::config('no_ignore_case');
-pod2usage(-verbose => 1) unless GetOptions("f|fa=s"     => \$infile_fa,
-					   "b|bed=s"    => \$infile_bed,
-					   "o|outdir=s" => \$outdir,
-					   "log"      => sub{$wantlog=1},
-					   "n=s"        => \$shuffle,
-					   "d"          => sub{$dinuc=2},
-					   "v|verbose"  => sub{$verbose=1},
-					   "w|window=s" => \$winlength,
-					   "plfoldW=i"  => \$plfoldW,
-					   "plfoldL=i"  => \$plfoldL,
-                                           "man"        => sub{pod2usage(-verbose => 2)},
-                                           "help|h"     => sub{pod2usage(1)}
-					  );
+pod2usage(-verbose => 1) unless
+  GetOptions("f|fa=s"     => \$infile_fa,
+	     "b|bed=s"    => \$infile_bed,
+	     "o|outdir=s" => \$outdir,
+	     "log"        => sub{$wantlog=1},
+	     "n=s"        => \$shuffle,
+	     "d"          => sub{$dinuc=2},
+	     "N|nozscore" => sub{$nozscore=1},
+	     "v|verbose"  => sub{$verbose=1},
+	     "w|window=s" => \$winlength,
+	     "plfoldW=i"  => \$plfoldW,
+	     "plfoldL=i"  => \$plfoldL,
+	     "man"        => sub{pod2usage(-verbose => 2)},
+	     "help|h"     => sub{pod2usage(1)}
+	    );
 
 unless (defined ($infile_fa)){
   warn "Please provide an infput fasta file to  -f|--fa option ...";
@@ -88,7 +97,9 @@ my $cwd = getcwd();
 unless ($infile_bed =~ /^\// || $infile_bed =~ /^\.\//){$infile_bed = file($cwd,$infile_bed);}
 unless ($infile_fa  =~ /^\// || $infile_fa  =~ /^\.\//){$infile_fa  = file($cwd,$infile_fa);}
 
+#print " ++ outdir: $outdir++\n";
 unless(defined $outdir) { # not given via command line
+  print " outdir is not defined vi cmdl\n";
   $od = $infile_bed->dir;
 }
 else { # given via commandline
@@ -96,19 +107,32 @@ else { # given via commandline
   $od = $dir->absolute;
   unless (-d $od){mkdircheck($od);}
 }
+
+# obtain UUID
+my $uido = Data::UUID->new();
+my $uuid = $uido->create_str();
 $bn = basename($infile_bed, ".bed");
-$outfile = file($od,$bn.".plfoldz.out");
+$outfile = file($od,$bn.".".$uuid.".plfoldz.out");
 open($outfh, ">", $outfile) or die "Cannot open outfile $outfile";
+$yamlfile = file($od,$bn.".".$uuid.".plfoldz.yaml");
 
 if (defined $wantlog){
-
-  $logfile = file($od,$bn.".plfoldz.log");
-  print "logfile $logfile ";
+  $logfile = file($od,$bn.".".$uuid.".plfoldz.log");
+  #print "logfile $logfile ";
   open($logfh, ">", $logfile) or die "Cannot open logfile $logfile";
-  print "DONE\n";
+  #print "DONE\n";
 }
 
-#print ">>> $outfile\n";die;
+if (defined $dinuc){ $klet = $dinuc };
+
+%params = ( n => $shuffle, # store parameters for YAML dump
+	    d => $klet,
+	    T => $T,
+	    winlen => $winlength,
+	    plfoldW =>$plfoldW,
+	    plfoldL => $plfoldL,
+	    uuid => $uuid,
+	    outdir => "$od");
 
 $fastaO    = Bio::ViennaNGS::Fasta->new(fasta=>"$infile_fa");
 $intervals = Bio::ViennaNGS::FeatureIO->new(
@@ -117,12 +141,11 @@ $intervals = Bio::ViennaNGS::FeatureIO->new(
 					    instanceOf => 'Feature',
 					   );
 
-#print Dumper($fastaO);
-#print Dumper($intervals);
-
 foreach my $f (@{$intervals->data}){
   my ($seq,$seq5,$seq3,$motiflength,$winlength5,$winlength3,$z);
-  my ($ustart,$uend,$start,$dend); # upstream / downstream window borders
+  my ($shufseq5,$shufseq3,$ustart,$uend,$start,$dend);
+  my %dat_orig = (); # YAML entry for the orig sequence
+  my @shuf_oe = ();
   confess "ERROR: ID ".$f->chromosome." not found in Fasta file $infile_fa"
     unless ($fastaO->has_sequid($f->chromosome));
   my $fc = Bio::ViennaNGS::FeatureChain->new(type => "interval",
@@ -146,9 +169,7 @@ foreach my $f (@{$intervals->data}){
   $uend = $f->start;
   if($ustart < 1){
     $ustart = 1;
-    if ($uend < $ustart){
-      $seq5 = "";
-    }
+    if ($uend < $ustart){$seq5 = ""}
     else{
       $seq5 = $fastaO->stranded_subsequence($f->chromosome,
 					    $ustart,
@@ -174,27 +195,35 @@ foreach my $f (@{$intervals->data}){
 
   if (defined $wantlog){
     print $logfh join "\t", $f->chromosome,$f->name,$f->start+1,$f->end,"\n";
-#    print $logfh join "\n",  "$seq5\t$ustart\t$uend",$seq,"$seq3\t".$f->end+1."\t".$f->end+1+$winlength-1;
-    print $logfh "$seq5 $seq $seq3(ori)\n";
   }
 
-  my $seqori = $seq5.$seq.$seq3;
   # compute opening energies for original sequence
+  my $seqori = $seq5.$seq.$seq3;
   my $motifendpos = $motiflength+$winlength5;
   my $motifoe = compute_opening_energy($seqori,$motiflength,$plfoldW,$plfoldL,$motifendpos,$logfh);
+  %dat_orig = ( seq => $seqori,
+		motif => $seq,
+		oe => $motifoe,
+		endpos => $motifendpos,
+		start => $f->start,
+		end => $f->end,
+		sum => sha1_base64($seqori),
+		chr => $f->chromosome,
+		strand => $f->strand,
+		name => $f->name,
+		score => $f->score);
+
   if (defined $wantlog){
     print $logfh "0 $seqori * (pos $motifendpos): $motifoe\n";
   }
   my @seq_up = split('',$seq5); # sequence upstream of motif
   my @seq_do = split('',$seq3); # sequence sownstream of motif
-  my @shuf_oe=();
-  my ($shufseq5,$shufseq3);
+
   if (defined $dinuc){ # initialize output sequence
     for(1..length($seq5)){$shufseq5 .= "a";}
     for(1..length($seq3)){$shufseq3 .= "a";}
   }
-  for (my $i=0;$i<$shuffle;$i++){
-
+  for (my $i=0;$i<$shuffle;$i++){ # loop over n shuffled sequences
     unless (defined $dinuc){ # mononucleotide Fisher-Yates shuffling
       my @shuf5 = @seq_up;
       my @shuf3 = @seq_do;
@@ -213,7 +242,6 @@ foreach my $f (@{$intervals->data}){
     }
     my $seqshuf = $shufseq5.$seq.$shufseq3;
 
-
     # computation of unpair probs / opening energies via ViennaRNA library call:
     my $oe = compute_opening_energy($seqshuf,$motiflength,$plfoldW,$plfoldL,$motifendpos,$logfh);
     if (defined $wantlog) {
@@ -222,22 +250,31 @@ foreach my $f (@{$intervals->data}){
       else{print $logfh "$j\t$oe\n"}
     }
     push @shuf_oe, $oe;
-  }
+  } # end for
   #print Dumper(\@shuf_oe);
 
-  if (Statistics::Lite::stddev(@shuf_oe) != 0.){
-    $z = ($motifoe - Statistics::Lite::mean(@shuf_oe))/Statistics::Lite::stddev(@shuf_oe);
-  }
-  else {$z = 'NAN'}
+  unless (defined $nozscore){
+    if (Statistics::Lite::stddev(@shuf_oe) != 0.){
+      $z = ($motifoe - Statistics::Lite::mean(@shuf_oe))/Statistics::Lite::stddev(@shuf_oe);
+    }
+    else {$z = 'NAN'}
 
-  my $out = $$bed6array[0]."\t$motifoe\t$z";
-  print $outfh "$out\n";
-  if (defined $wantlog) { print $logfh "z-score: $z\n"}
+    my $out = $$bed6array[0]."\t$motifoe\t$z";
+    print $outfh "$out\n";
+    if (defined $wantlog) { print $logfh "z-score: $z\n"}
+  }
+
+  my @shuf_clone = @shuf_oe;
+  my %yaml = ( origin => \%dat_orig,
+	       shufoe => \@shuf_clone,
+	     );
+  push @data, \%yaml;
   undef @shuf_oe; # memory cleanup
 } # end foreach
 
 close($outfh);
 if (defined $wantlog){close($logfh)}
+my $dmp_yaml = YAML::XS::DumpFile($yamlfile, { params => \%params, data => \@data } );
 
 sub compute_opening_energy {
   my ($seq, $ulength, $window_size,$max_bp_span,$where,$lfh) = @_;
@@ -274,26 +311,31 @@ plfoldz.pl - Compute z-score for opening energies of intervals
 =head1 SYNOPSIS
 
 plfoldz.pl [-f|--fa I<FILE>] [-b|--bed I<FILE>] [-n I<INT>] [-d]
-[-o|--outdir I<DIR>] [-w|--window I<INT>] [--log] [--plfoldW I<INT>] 
-[--plfoldL I<INT>] [-v|--verbose] options
+[-o|--outdir I<DIR>] [-w|--window I<INT>] [--log] [--plfoldW I<INT>]
+[--plfoldL I<INT>] [-N|--nozscore] [-v|--verbose] options
 
 =head1 DESCRIPTION
 
-This script computes z-scores of opening energies for an RNA serquence
+This script computes z-scores of opening energies for an RNA sequence
 in genomic context related to the same sequence in a shuffled context
 (albeit preserving the relative nucleotide frequencies in surrounding
 windows, optionally applying dinucleotide shuffling).
 
-The idea is as follows. We are interested in the opening energy of
-interval XXX in its genomic context
+The idea is as follows. We are interested in the (mean) opening energy
+of interval I in its genomic context (let XXX represent I here)
+
  ----|augaagaugaXXXaugaagauga|---
-relative to the opening energy in a shuffled context
+ relative to the opening energy in a shuffled context
  ----|uaaggaaaguXXXgauugaaaga|----
 
-The flanking regions upstream and downstream of the motif of interest
-are shuffled n times, while the motif itself is unchanged. Mean
-opening energies are computed for each shuffled sequence and a z-score
-is computed.
+The flanking regions upstream and downstream of the motif (interval)
+of interest I are shuffled n times, while the motif itself is left
+unchanged. Mean opening energies of interval I are computed in a
+genomic context (native sequence) as well as for each of the n suffled
+sequences by (a library call to) RNAplfold. A z-score is computed for
+the mean opening energies of interval I (this can be turned off by the
+B<-N|--nozscore> flag, which is essentially useful when the
+calculations are done in a distributed cluster environment).
 
 Input RNA sequences are provided as BED6 intervals, together with a
 genomic Fasta file (evidently, Fasta and BED IDs should match). The
@@ -337,6 +379,14 @@ Number of shuffling events (default: 1000).
 Enable dinucleotide shuffling using the uShuffle library. Default is
 Fisher-Yates mononucleotide shuffling.
 
+=item B<-N|--nozscore>
+
+Turn off the default calculation of opening energy z-scores, just
+report the mean opening energies for each interval. This option is
+typically used in cluster environment, when shuffling is distributed
+over several compute nodes. Computation of z-scores is then performed
+with F<plfoldz_gather_zscores.pl>.
+
 =item B<-w|--window>
 
 Window size of upstream/downstream nucleotides that will be used for
@@ -344,7 +394,9 @@ shuffling.
 
 =item B<--plfoldW>
 
-Size of sliding window for computation of local base pairing probabilitied . This is essialliy the same as the -W parameter to RNAplfold.
+Size of sliding window for computation of local base pairing
+probabilitied . This is essialliy the same as the -W parameter to
+RNAplfold.
 
 =item B<--plfoldL>
 
